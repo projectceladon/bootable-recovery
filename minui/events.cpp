@@ -22,6 +22,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
+#include <sys/inotify.h>
 #include <unistd.h>
 
 #include <functional>
@@ -39,7 +40,9 @@ struct fd_info {
   ev_callback cb;
 };
 
+static ev_callback input_cb_bak;
 static int g_epoll_fd;
+static int g_inotify_fd;
 static epoll_event polledevents[MAX_DEVICES + MAX_MISC_FDS];
 static int npolledevents;
 
@@ -53,10 +56,55 @@ static bool test_bit(size_t bit, unsigned long* array) { // NOLINT
     return (array[bit/BITS_PER_LONG] & (1UL << (bit % BITS_PER_LONG))) != 0;
 }
 
+#define BUF_LEN (3 * (sizeof(struct inotify_event) + NAME_MAX + 1))
+static int inotify_cb(int fd, uint32_t epevents) {
+  struct inotify_event *pevent;
+  char buf[BUF_LEN] __attribute__ ((aligned(8)));
+  char *p;
+  int len;
+
+  (void)epevents;
+  len = read(fd, buf, BUF_LEN);
+  if (len > 0) {
+    unsigned long ev_bits[BITS_TO_LONGS(EV_MAX)];
+    DIR* dir = opendir("/dev/input");
+    if (dir == NULL) return -1;
+    for (p = buf; p < buf + len; ) {
+      pevent = (struct inotify_event *) p;
+      p += sizeof(struct inotify_event) + pevent->len;
+
+      if (strncmp(pevent->name, "event", 5)) continue;
+
+      int fd = openat(dirfd(dir), pevent->name, O_RDONLY);
+      if (fd == -1) continue;
+      // Read the evbits of the input device.
+      if (ioctl(fd, EVIOCGBIT(0, sizeof(ev_bits)), ev_bits) == -1) {
+        close(fd);
+        continue;
+      }
+      // We assume that only EV_KEY, EV_REL, and EV_SW event types are ever needed.
+      if (!test_bit(EV_KEY, ev_bits) && !test_bit(EV_REL, ev_bits) && !test_bit(EV_SW, ev_bits)) {
+        close(fd);
+        continue;
+      }
+
+      ev_add_fd(fd, input_cb_bak);
+    }
+    closedir(dir);
+  }
+  return 0;
+}
+
 int ev_init(ev_callback input_cb, bool allow_touch_inputs) {
   g_epoll_fd = epoll_create(MAX_DEVICES + MAX_MISC_FDS);
   if (g_epoll_fd == -1) {
     return -1;
+  }
+
+  g_inotify_fd = inotify_init();
+  if (g_inotify_fd >= 0) {
+    inotify_add_watch(g_inotify_fd, "/dev/input", IN_CREATE);
+    ev_add_fd(g_inotify_fd, inotify_cb);
   }
 
   bool epollctlfail = false;
@@ -111,6 +159,8 @@ int ev_init(ev_callback input_cb, bool allow_touch_inputs) {
     return -1;
   }
 
+  input_cb_bak = input_cb;
+
   return 0;
 }
 
@@ -144,6 +194,7 @@ void ev_exit(void) {
     ev_misc_count = 0;
     ev_dev_count = 0;
     close(g_epoll_fd);
+    close(g_inotify_fd);
 }
 
 int ev_wait(int timeout) {
